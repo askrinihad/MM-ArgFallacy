@@ -50,14 +50,12 @@ cd MM-ArgFallacy
 pip install -r requirements.txt
 ```
 
-## Using fine-tuned models 
+## Using fine-tuned models
 
+If you want to test the fine-tuned models, you can download them from the **GitHub Releases** page. The available models include:
 
-If you want to test the fine-tuned models, you can download them from the **GitHub Releases** section:
- 
-- [`cross_attn_gated_fusion_best.pt`](https://github.com/askrinihad/MM-ArgFallacy/releases/latest/download/cross_attn_gated_fusion_best.pt) — **Transformer Gated Fusion**  
-- [`late-fusion_classifier.pt`](https://github.com/askrinihad/MM-ArgFallacy/releases/latest/download/late-fusion_classifier.pt) — **Late fusion / context-aware concatenation**
-
+- `cross_attn_gated_fusion_best.pt` — **Transformer Gated Fusion**  
+- `late-fusion_classifier.pt` — **Late fusion / context-aware concatenation**
 
 > After downloading, place the model files in the expected checkpoint directory used by your scripts (see your training/testing scripts for the exact path).
 

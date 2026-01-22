@@ -10,7 +10,7 @@ We explore:
 
 ---
 
-##  What’s inside
+##  Implemented Methods
 
 ### 1) Text-only baseline
 A text-only classifier using MM-USED-fallacy.

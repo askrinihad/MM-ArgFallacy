@@ -1,0 +1,263 @@
+
+# MULTIMODAL DIALOGUE CONTEXT MODEL (TEXT n-2, n-1, n + AUDIO)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from transformers import RobertaTokenizer, RobertaModel, Wav2Vec2FeatureExtractor, AdamW
+import torchaudio
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, confusion_matrix
+from mamkit.data.datasets import MMUSEDFallacy, InputMode
+
+
+device = torch.device("cuda") if torch.cuda.is_available() else \
+         torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+print("Using device:", device)
+
+
+loader = MMUSEDFallacy(task_name="afd", input_mode=InputMode.TEXT_AUDIO)
+split_info = list(loader.get_splits("mancini-et-al-2024"))[0]
+
+def clean_dataset(dataset):
+    clean_texts, clean_audios, clean_labels = [], [], []
+    for t, a, l in zip(dataset.texts, dataset.audio, dataset.labels):
+        if l is None or np.isnan(l):
+            continue
+        clean_texts.append(t)
+        clean_audios.append(a)
+        clean_labels.append(int(l))
+    dataset.texts = clean_texts
+    dataset.audio = clean_audios
+    dataset.labels = clean_labels
+    return dataset
+
+train_data = clean_dataset(split_info.train)
+val_data   = clean_dataset(split_info.val)
+test_data  = clean_dataset(split_info.test)
+
+
+tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+audio_extractor = Wav2Vec2FeatureExtractor.from_pretrained("ntu-spml/distilhubert")
+MAX_AUDIO_LEN = 160000
+MAX_TEXT_LEN = 128
+
+
+class TextDatasetWithContext(Dataset):
+    def __init__(self, texts, labels, tokenizer, n_context=2, max_len=MAX_TEXT_LEN):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.n_context = n_context
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        start = max(0, idx - self.n_context)
+        context_text = " ".join(self.texts[start:idx+1])
+        enc = self.tokenizer(context_text, truncation=True, padding="max_length",
+                             max_length=self.max_len, return_tensors="pt")
+        return {
+            "input_ids": enc["input_ids"].squeeze(0),      # [seq_len]
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+
+class AudioDataset(Dataset):
+    def __init__(self, paths, labels, extractor, max_len=MAX_AUDIO_LEN):
+        self.paths = paths
+        self.labels = labels
+        self.extractor = extractor
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        try:
+            wav, sr = torchaudio.load(str(self.paths[idx]))
+        except:
+            wav = torch.zeros(self.max_len)
+            sr = 16000
+
+        if wav.numel() == 0:
+            wav = torch.zeros(self.max_len)
+            sr = 16000
+        if sr != 16000:
+            wav = torchaudio.transforms.Resample(sr, 16000)(wav)
+        wav = wav.squeeze(0)
+        wav = wav[:self.max_len]
+        wav = F.pad(wav, (0, self.max_len - wav.size(0)))
+        feats = self.extractor(wav, sampling_rate=16000, return_tensors="pt").input_values.squeeze(0)
+        feats = feats.mean(dim=0).repeat(768)
+        return feats, torch.tensor(self.labels[idx], dtype=torch.long)
+
+class MultimodalDataset(Dataset):
+    def __init__(self, text_ds, audio_ds):
+        self.text_ds = text_ds
+        self.audio_ds = audio_ds
+
+    def __len__(self):
+        return len(self.text_ds)
+
+    def __getitem__(self, idx):
+        text_item = self.text_ds[idx]
+        audio_item = self.audio_ds[idx]
+        return {
+            "input_ids": text_item["input_ids"],
+            "attention_mask": text_item["attention_mask"],
+            "audio": audio_item[0],
+            "labels": text_item["labels"]
+        }
+
+
+def collate_fn(batch):
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    attention_mask = torch.stack([b["attention_mask"] for b in batch])
+    audio = torch.stack([b["audio"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "audio": audio,
+        "labels": labels
+    }
+
+
+labels = train_data.labels
+class_weights_np = compute_class_weight("balanced", classes=np.unique(labels), y=labels)
+class_weights = torch.tensor(class_weights_np, dtype=torch.float)
+
+sample_weights = [class_weights[label] for label in labels]
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+
+train_ds = MultimodalDataset(TextDatasetWithContext(train_data.texts, train_data.labels, tokenizer),
+                             AudioDataset(train_data.audio, train_data.labels, audio_extractor))
+val_ds   = MultimodalDataset(TextDatasetWithContext(val_data.texts, val_data.labels, tokenizer),
+                             AudioDataset(val_data.audio, val_data.labels, audio_extractor))
+test_ds  = MultimodalDataset(TextDatasetWithContext(test_data.texts, test_data.labels, tokenizer),
+                             AudioDataset(test_data.audio, test_data.labels, audio_extractor))
+
+train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler, collate_fn=collate_fn)
+val_loader   = DataLoader(val_ds, batch_size=16, shuffle=False, collate_fn=collate_fn)
+test_loader  = DataLoader(test_ds, batch_size=16, shuffle=False, collate_fn=collate_fn)
+
+#multimodal model
+class MultimodalClassifier(nn.Module):
+    def __init__(self, num_classes=2, text_model_name="roberta-base", audio_feat_dim=768):
+        super().__init__()
+        self.text_encoder = RobertaModel.from_pretrained(text_model_name)
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_feat_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 768)
+        )
+        self.classifier = nn.Linear(768*2, num_classes)
+
+    def forward(self, input_ids, attention_mask, audio):
+        t_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+        a_out = self.audio_proj(audio)
+        x = torch.cat([t_out, a_out], dim=1)
+        return self.classifier(x)
+
+num_classes = len(set(train_data.labels))
+model = MultimodalClassifier(num_classes=num_classes).to(device)
+
+#focal loss with class weights
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.alpha.to(logits.device), reduction="none")
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+criterion = FocalLoss(alpha=class_weights, gamma=1.0)
+
+#training loop
+def train_model(model, train_loader, val_loader, epochs=15, lr=5e-5, patience=5):
+    optimizer = AdamW(model.parameters(), lr=lr)
+    best_val_f1 = 0.0
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            audio = batch["audio"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits = model(input_ids, attention_mask, audio)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Validation
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                audio = batch["audio"].to(device)
+                labels = batch["labels"].to(device)
+
+                logits = model(input_ids, attention_mask, audio)
+                preds = torch.argmax(logits, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        val_f1 = f1_score(all_labels, all_preds, average="binary")
+        print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_model-turn.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered")
+                break
+
+    model.load_state_dict(torch.load("best_model-turn.pt"))
+    return model
+
+#evaluation function
+def evaluate_model(model, loader):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            audio = batch["audio"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits = model(input_ids, attention_mask, audio)
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    f1 = f1_score(all_labels, all_preds, average="binary")
+    cm = confusion_matrix(all_labels, all_preds)
+    print(f"Binary F1: {f1:.4f}")
+    print("Confusion Matrix:\n", cm)
+
+#train and evaluate
+best_model = train_model(model, train_loader, val_loader, epochs=15, lr=5e-5, patience=5)
+print("\n Test evaluation:")
+evaluate_model(best_model, test_loader)

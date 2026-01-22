@@ -13,7 +13,7 @@ We explore:
 ##  Implemented Methods
 
 ### 1) Text-only baseline
-A text-only classifier using MM-USED-fallacy.
+A text-only classifier based on RoBERTa using the MM-USED-fallacy dataset.
 
 ### 2) Text + Audio (multimodal) approaches
 We implement and compare three multimodal strategies:

@@ -42,14 +42,15 @@ Before installing requirements, ensure you have:
 
 ---
 
-##  Installation
+## Installation
 
 ```bash
 git clone https://github.com/askrinihad/MM-ArgFallacy.git
 cd MM-ArgFallacy
 pip install -r requirements.txt
+```
 
-## 🧪 Using fine-tuned models (optional)
+## Using fine-tuned models 
 
 If you want to test the fine-tuned models, you can download them from the **GitHub Releases** section:
 

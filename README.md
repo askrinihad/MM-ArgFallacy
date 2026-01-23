@@ -54,8 +54,9 @@ pip install -r requirements.txt
 
 If you want to test the fine-tuned models, you can download them from the **GitHub Releases** page. The available models include:
 
+- `roberta-text_only-finetuned` — **Text-only** fine-tuned model  
 - `cross_attn_gated_fusion_best.pt` — **Transformer Gated Fusion**  
-- `late-fusion_classifier.pt` — **Late fusion / context-aware concatenation**
+- `late-fusion_classifier.pt` — **Late fusion**
 
 > After downloading, place the model files in the expected checkpoint directory used by your scripts (see your training/testing scripts for the exact path).
 

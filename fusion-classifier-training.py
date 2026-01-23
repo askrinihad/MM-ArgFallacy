@@ -82,7 +82,7 @@ for epoch in range(epochs):
 torch.save({
     "state_dict": fusion_model.state_dict(),
     "input_dim": train_emb.size(1)
-}, "./saved_models_balanced/fusion/fusion_classifier.pt")
+}, "./saved_models_balanced/fusion/late-fusion_classifier.pt")
 print(" Fusion classifier saved")
 
 
